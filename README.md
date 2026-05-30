@@ -2,6 +2,8 @@
 
 Reads real-time data from a DALY Smart BMS (Model K) over UART/RS-485 using the Modbus protocol and maintains a Python dictionary (`BMS_Data`) of current values.
 
+The reader polls the BMS on a fixed cadence using batched Modbus reads, validates each value against its physical scope, records a per-key freshness timestamp, and automatically reconnects if the serial link drops.
+
 ## Hardware
 
 - DALY Smart BMS Model K
@@ -27,7 +29,8 @@ Edit the constants at the top of `bms_reader.py`:
 | `PORT` | `/dev/ttyUSB0` | Serial device (check with `ls /dev/ttyUSB*`) |
 | `BAUD` | `9600` | Must match BMS setting |
 | `TIMEOUT` | `2.0` | Seconds to wait for a response frame |
-| `POLL_INTERVAL` | `1` | Seconds between full poll cycles |
+| `POLL_INTERVAL` | `1.0` | Target seconds per full poll cycle |
+| `RECONNECT_DELAY` | `5` | Seconds between reconnect attempts after a serial error |
 
 ## Usage
 
@@ -35,7 +38,35 @@ Edit the constants at the top of `bms_reader.py`:
 python3 bms_reader.py
 ```
 
-The script opens the serial port, then repeatedly loops through all registers, updating `BMS_Data` after each complete cycle.
+The script opens the serial port, then repeatedly polls the BMS, updating `BMS_Data` after each complete cycle. The cycle period is held stable using a monotonic clock (it sleeps only the remainder of `POLL_INTERVAL`), so slow reads or timeouts don't compound the loop interval.
+
+### Resilience
+
+- **Auto-reconnect** — a `serial.SerialException` (e.g. an unplugged USB adapter) is caught, logged, and the port is reopened after `RECONNECT_DELAY` seconds instead of crashing the process.
+- **Scope validation** — each value is checked against its physical range before being stored. Out-of-range readings are logged and the previous value is left in place, except temperatures, whose upper bound (150 °C) is wide enough that thermal-fault readings are never silently dropped.
+- **Modbus exception detection** — exception frames (function byte `0x83`) are recognised and logged with their exception code, distinct from a cable fault or timeout.
+
+### Data freshness
+
+Failed or out-of-range reads leave the last good value in `BMS_Data`. To detect stale data, every successful write also records a timestamp. Use `is_fresh()` to check a key:
+
+```python
+from bms_reader import BMS_Data, is_fresh
+
+if is_fresh('total_voltage'):          # updated within the last 5 s (default)
+    print(BMS_Data['total_voltage'])
+
+is_fresh('soc', max_age=2.0)           # custom freshness window in seconds
+```
+
+## Tests
+
+A test suite (`test_bms_reader.py`, 67 tests) covers the CRC, frame building/parsing, scope validation, RTC decoding, freshness tracking, and reconnect behaviour. It uses a fake serial port and requires no hardware:
+
+```bash
+pip install pytest
+pytest test_bms_reader.py
+```
 
 ## Protocol
 
@@ -56,6 +87,20 @@ The script opens the serial port, then repeatedly loops through all registers, u
 | Byte | 0 | 1 | 2 | 3 … (2N+2) | last 2 |
 |---|---|---|---|---|---|
 | Field | ADDR (`0x51`) | CMD (`0x03`) | Length (= 2N) | Register data | CRC-16 (LE) |
+
+### Batched reads
+
+Rather than one request per register, the poll cycle issues a handful of batched Modbus reads:
+
+| Block | Registers | Contents |
+|---|---|---|
+| Bootstrap | `0x3C`–`0x3D` | `battery_count`, `temp_sensor_count` (read first to size the reads below) |
+| 1 | `0x00` … | Cell voltages (`battery_count` registers) |
+| 2 | `0x30` … | Temperatures (`temp_sensor_count` registers) |
+| 3 | `0x38`–`0x65` | Main scalar data (46 registers; `0x4E` and `0x5E` are gaps) |
+| 4 | `0x6B` | Wake source |
+| 5 | `0x6D`–`0x73` | Fault codes |
+| 6 | `0x7E` | Communication interface type |
 
 ## BMS_Data dictionary
 
@@ -111,4 +156,4 @@ All values are converted to human-readable units:
 
 ## Protocol reference
 
-`KVMS_intranet_communication_UART_protocol_(customer_version).xlsx` (included in this repo's working directory, not tracked by git).
+`KVMS_intranet_communication_UART_protocol_(customer_version)..xlsx` — included in the repo. The `Real-time data` sheet defines the register addresses, content names, scopes, and data-calculation formulas; the `modbus format` sheet documents the frame layout.
